@@ -1,0 +1,138 @@
+# The rebuilt app (server/ + web/) as it runs on the PC, one file for every environment
+# (deploy/README.md). deploy.sh runs it as the compose project coji-<env> with deploy/<env>.env and
+# that environment's secrets, so test and prod are the same services and differ only in those
+# values and in their own volumes. The images come from `deploy.sh build`, tagged with the commit
+# they were built from (TAG); nothing here builds.
+
+x-logging: &logging
+  # Docker keeps container logs on the PC's disk: at most 3 x 10 MB per container.
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+# The server image's settings, its own anchor so a service can add to it (YAML merges are shallow).
+x-server-env: &server-env
+  COJI_DATABASE_URL: postgresql+psycopg://coji:${POSTGRES_PASSWORD:?}@db:5432/cojidaily
+  COJI_SECRET_KEY: ${COJI_SECRET_KEY:?}
+  COJI_BLOB_ROOT: /data/blobs
+  COJI_TIMEZONE: ${COJI_TIMEZONE:-America/New_York}
+  # Plain HTTP on the home Wi-Fi (pm/topics/app-hosting-setup.md): a Secure cookie would not come back.
+  COJI_SECURE_COOKIES: "0"
+  COJI_WORKER_THREADS: ${COJI_WORKER_THREADS:-2}
+  COJI_READING_PROVIDER: vllm
+  VLLM_BASE_URL: ${VLLM_BASE_URL:?}
+  VLLM_MODEL: ${VLLM_MODEL:-Qwen/Qwen3-VL-30B-A3B-Instruct}
+  VLLM_API_KEY: ${VLLM_API_KEY:-}
+  VLLM_TIMEOUT_SECONDS: ${VLLM_TIMEOUT_SECONDS:-300}
+  # Telemetry to the shared collector (deploy/observability/), labeled with the environment. When
+  # the collector is down the SDK drops what it cannot send; requests and jobs never wait for it.
+  OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-false}
+  OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=${COJI_ENV:?}
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: otlp
+  OTEL_LOGS_EXPORTER: otlp
+  OTEL_METRIC_EXPORT_INTERVAL: "30000"
+  OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED: "true"
+  OTEL_SEMCONV_STABILITY_OPT_IN: http
+
+x-server: &server
+  image: cojidaily-server:${TAG:?run through deploy/deploy.sh}
+  restart: unless-stopped
+  cpu_shares: ${CPU_SHARES:-1024}
+  logging: *logging
+  environment: *server-env
+  volumes:
+    - blobs:/data/blobs
+  networks: [default, obs]
+
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    cpu_shares: ${CPU_SHARES:-1024}
+    logging: *logging
+    environment:
+      POSTGRES_USER: coji
+      # Read only when the volume is new: changing it later does not change the password.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: cojidaily
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Over TCP: the first start's temporary server listens on the socket only.
+      test: ["CMD", "pg_isready", "-q", "-h", "127.0.0.1", "-U", "coji", "-d", "cojidaily"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Brings the schema up to this image's migrations. Not started with the rest: deploy.sh runs it
+  # once, after the database and before the new API and worker.
+  migrate:
+    <<: *server
+    restart: "no"
+    profiles: [tools]
+    command: ["alembic", "upgrade", "head"]
+    networks: [default]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    <<: *server
+    environment:
+      <<: *server-env
+      OTEL_SERVICE_NAME: cojidaily-api
+      # Docker's health check asks every 10 s; those requests are not worth a trace each.
+      OTEL_PYTHON_FASTAPI_EXCLUDED_URLS: api/health
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  worker:
+    <<: *server
+    environment:
+      <<: *server-env
+      OTEL_SERVICE_NAME: cojidaily-worker
+    command: ["opentelemetry-instrument", "python", "-m", "cojidaily.worker"]
+    # Time for a running job to finish when the worker is replaced; a reading cut off here is
+    # taken again once its lease runs out (platform/jobs.py).
+    stop_grace_period: 30s
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    image: cojidaily-web:${TAG:?run through deploy/deploy.sh}
+    restart: unless-stopped
+    cpu_shares: ${CPU_SHARES:-1024}
+    logging: *logging
+    ports:
+      # The home Wi-Fi, plain HTTP, like the old app's 8080 (pm/topics/app-hosting-setup.md).
+      - "${WEB_PORT:?}:80"
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+networks:
+  # The observability stack's network (deploy/observability/compose.yaml). deploy.sh creates it,
+  # so an environment starts whether that stack runs or not.
+  obs:
+    name: coji-obs
+    external: true
+
+volumes:
+  pgdata:
+  blobs:

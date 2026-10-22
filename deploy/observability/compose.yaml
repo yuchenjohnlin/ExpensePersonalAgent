@@ -1,0 +1,49 @@
+# The observability backend for every environment on the PC (deploy/README.md): Grafana's all-in-one
+# image (OpenTelemetry Collector, Prometheus, Tempo, Loki, Pyroscope, Grafana). A compose project of
+# its own, so stopping an environment or resetting test keeps the history; everything it stores is
+# under /data, kept in a volume.
+#
+# Capped so it cannot crowd out the app on the same PC: at most 2 GiB and two CPUs, a quarter of
+# the app's CPU weight when both want the CPU, and the first container the kernel kills when memory
+# runs out. The environments reach it as lgtm:4318 on the coji-obs network; only Grafana is published.
+name: coji-obs
+
+services:
+  lgtm:
+    image: grafana/otel-lgtm:0.34.0
+    restart: unless-stopped
+    ports:
+      # Grafana on the home Wi-Fi. It opens without a login (the image is made for development),
+      # so anyone on the Wi-Fi can read it: request paths, ids, timings and errors, no photos.
+      - "3000:3000"
+    environment:
+      # Prometheus keeps 15 days by default; this also stops it at 2 GB. Tempo and Loki keep the
+      # image's defaults (deploy/README.md).
+      PROMETHEUS_EXTRA_ARGS: --storage.tsdb.retention.size=2GB
+    volumes:
+      - data:/data
+    networks: [obs]
+    mem_limit: 2g
+    cpus: 2
+    cpu_shares: 256
+    oom_score_adj: 500
+    healthcheck:
+      # run-all.sh writes this file once every component answers.
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  obs:
+    name: coji-obs
+    external: true
+
+volumes:
+  data:
